@@ -1,6 +1,6 @@
 'use strict';
 
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.3.0';
 const MAX_CLIP_SECONDS = 30;
 const MAX_FILE_BYTES = 250 * 1024 * 1024;
 const SETTINGS_KEY = 'ringtone-forge-404-settings-v1';
@@ -17,7 +17,14 @@ const state = {
   objectUrl: null,
   pointerMode: null,
   deferredInstallPrompt: null,
-  smartCutRunning: false
+  smartCutRunning: false,
+  previewBuffer: null,
+  previewSignature: '',
+  previewBuildToken: 0,
+  previewBuilding: false,
+  previewPromise: null,
+  previewBuildSignature: '',
+  playheadRaf: null
 };
 
 const $ = id => document.getElementById(id);
@@ -26,6 +33,7 @@ const els = {
   fileName: $('fileName'), fileInfo: $('fileInfo'), waveform: $('waveform'), waveWrap: $('waveWrap'), overlay: $('selectionOverlay'),
   selectionLabel: $('selectionLabel'), selectedDuration: $('selectedDuration'), midTime: $('midTime'), endTime: $('endTime'),
   startInput: $('startInput'), endInput: $('endInput'), fadeIn: $('fadeIn'), fadeOut: $('fadeOut'), normalize: $('normalize'),
+  gainDb: $('gainDb'), gainValue: $('gainValue'), gainWarning: $('gainWarning'), playhead: $('playhead'),
   playButton: $('playButton'), stopButton: $('stopButton'), rewindButton: $('rewindButton'), forwardButton: $('forwardButton'), loopPreview: $('loopPreview'),
   outputName: $('outputName'), formatSelect: $('formatSelect'), formatNote: $('formatNote'), exportButton: $('exportButton'), exportCapability: $('exportCapability'),
   progressWrap: $('progressWrap'), progressBar: $('progressBar'), progressText: $('progressText'), downloadLink: $('downloadLink'), toast: $('toast'),
@@ -59,6 +67,7 @@ function saveSettings() {
       fadeIn: els.fadeIn.checked,
       fadeOut: els.fadeOut.checked,
       normalize: els.normalize.checked,
+      gainDb: Number(els.gainDb.value) || 0,
       format: els.formatSelect.value
     }));
   } catch {}
@@ -71,8 +80,56 @@ function restoreSettings() {
     if (typeof saved.fadeIn === 'boolean') els.fadeIn.checked = saved.fadeIn;
     if (typeof saved.fadeOut === 'boolean') els.fadeOut.checked = saved.fadeOut;
     if (typeof saved.normalize === 'boolean') els.normalize.checked = saved.normalize;
+    if (Number.isFinite(Number(saved.gainDb))) els.gainDb.value = String(Math.max(-12, Math.min(6, Number(saved.gainDb))));
     if ([...els.formatSelect.options].some(o => o.value === saved.format)) els.formatSelect.value = saved.format;
   } catch {}
+}
+
+
+function gainDbValue() {
+  return Math.max(-12, Math.min(6, Number(els.gainDb.value) || 0));
+}
+
+function dbToGain(db) {
+  return Math.pow(10, db / 20);
+}
+
+function updateGainUI() {
+  const db = gainDbValue();
+  els.gainDb.value = String(db);
+  els.gainValue.value = `${db > 0 ? '+' : ''}${db.toFixed(1)} dB`;
+  els.gainValue.textContent = els.gainValue.value;
+  els.gainWarning.classList.toggle('warn', db > (els.normalize.checked ? 1 : 0));
+  if (els.normalize.checked && db > 1) {
+    els.gainWarning.textContent = 'Con normalización, una ganancia superior a +1 dB puede superar 0 dBFS y recortar picos.';
+  } else if (!els.normalize.checked && db > 0) {
+    els.gainWarning.textContent = 'Ganancia positiva: comprueba el resultado para evitar clipping en fuentes ya muy altas.';
+  } else {
+    els.gainWarning.textContent = 'Se aplica después de la normalización y forma parte tanto del preview como de la exportación.';
+  }
+}
+
+function processingSignature() {
+  if (!state.buffer) return '';
+  return [
+    state.start.toFixed(4), state.end.toFixed(4),
+    els.fadeIn.checked ? 1 : 0, els.fadeOut.checked ? 1 : 0,
+    els.normalize.checked ? 1 : 0, gainDbValue().toFixed(1)
+  ].join('|');
+}
+
+function invalidateProcessedPreview(stop = true) {
+  state.previewBuffer = null;
+  state.previewSignature = '';
+  state.previewBuildToken++;
+  if (stop && state.source) stopPlayback();
+}
+
+function updatePlayhead(sec, visible = true) {
+  if (!state.buffer || !els.playhead) return;
+  const ratio = Math.max(0, Math.min(1, sec / state.buffer.duration));
+  els.playhead.style.left = `${ratio * 100}%`;
+  els.playhead.hidden = !visible;
 }
 
 function mimeSupported(type) {
@@ -82,8 +139,8 @@ function mimeSupported(type) {
 }
 
 const mimeMap = {
-  m4r: ['audio/mp4;codecs=mp4a.40.2', 'audio/mp4'],
-  m4a: ['audio/mp4;codecs=mp4a.40.2', 'audio/mp4'],
+  m4r: ['audio/mp4;codecs=mp4a.40.2', 'audio/mp4;codecs=\"mp4a.40.2\"'],
+  m4a: ['audio/mp4;codecs=mp4a.40.2', 'audio/mp4;codecs=\"mp4a.40.2\"'],
   mp3: ['audio/mpeg', 'audio/mp3'],
   ogg: ['audio/ogg;codecs=opus', 'audio/ogg']
 };
@@ -94,7 +151,7 @@ function bestMime(format) {
 
 function updateCapabilities() {
   const labels = ['WAV ✓'];
-  for (const fmt of ['m4r', 'mp3', 'ogg']) labels.push(`${fmt.toUpperCase()} ${bestMime(fmt) ? '✓' : '—'}`);
+  for (const fmt of ['m4r', 'm4a', 'mp3', 'ogg']) labels.push(`${fmt.toUpperCase()} ${bestMime(fmt) ? '✓' : '—'}`);
   els.exportCapability.textContent = labels.join(' · ');
   updateFormatNote();
 }
@@ -113,7 +170,7 @@ function updateFormatNote() {
   if (!mime) {
     els.formatNote.classList.add('warn');
     const fallback = fmt === 'm4r'
-      ? 'Este navegador no ofrece codificación AAC/MP4. Exporta WAV y termina el tono de iPhone con GarageBand/Finder.'
+      ? 'Este navegador no declara codificación AAC/MP4 explícita. Exporta WAV y termina el tono de iPhone con GarageBand/Finder.'
       : `Este navegador no expone un codificador ${fmt.toUpperCase()} compatible. Selecciona WAV u otro formato disponible.`;
     els.formatNote.textContent = fallback;
     els.exportButton.disabled = true;
@@ -123,7 +180,7 @@ function updateFormatNote() {
   if (fmt === 'm4r') {
     els.formatNote.textContent = `M4R disponible mediante ${mime}. Se genera localmente como audio AAC/MP4 con extensión .m4r; la instalación final depende de iOS/Finder/GarageBand.`;
   } else {
-    els.formatNote.textContent = `${fmt.toUpperCase()} disponible mediante el codificador multimedia del navegador (${mime}). La codificación es local y puede tardar aproximadamente lo mismo que dura el fragmento.`;
+    els.formatNote.textContent = `${fmt.toUpperCase()} disponible mediante el codificador multimedia del navegador (${mime}). La codificación es local y puede tardar aproximadamente lo mismo que dura el fragmento. La app mostrará el tiempo transcurrido y validará el archivo antes de ofrecerlo.`;
   }
 }
 
@@ -208,6 +265,7 @@ function updateSelectionUI() {
   els.overlay.style.width = `${Math.max(0, width)}%`;
   state.playbackOffset = Math.max(state.start, Math.min(state.playbackOffset || state.start, state.end));
   updateQuickDurationButtons();
+  invalidateProcessedPreview();
   clearDownload();
 }
 
@@ -306,6 +364,7 @@ async function loadFile(file) {
     state.start = 0;
     state.end = Math.min(MAX_CLIP_SECONDS, buffer.duration);
     state.playbackOffset = 0;
+    invalidateProcessedPreview(false);
 
     els.fileName.textContent = file.name;
     const channelLabel = buffer.numberOfChannels === 1 ? 'Mono' : buffer.numberOfChannels === 2 ? 'Estéreo' : `${buffer.numberOfChannels} canales`;
@@ -329,50 +388,106 @@ async function loadFile(file) {
 }
 
 function stopPlayback(resetOffset = true) {
-  clearInterval(state.stopTimer);
-  state.stopTimer = null;
+  if (state.playheadRaf) cancelAnimationFrame(state.playheadRaf);
+  state.playheadRaf = null;
   if (state.source) {
     try { state.source.onended = null; state.source.stop(); } catch {}
     state.source.disconnect?.();
     state.source = null;
   }
   if (resetOffset) state.playbackOffset = state.start;
+  updatePlayhead(state.playbackOffset || state.start, false);
   const icon = els.playButton.querySelector('span[aria-hidden]');
   const label = els.playButton.querySelector('span:last-child');
   if (icon) icon.textContent = '▶';
-  if (label) label.textContent = 'Escuchar selección';
+  if (label) label.textContent = 'Escuchar resultado';
+  els.playButton.disabled = false;
+}
+
+function startPlaybackTicker(ctx, startedAt, baseOffset) {
+  if (state.playheadRaf) cancelAnimationFrame(state.playheadRaf);
+  const tick = () => {
+    if (!state.source) return;
+    state.playbackOffset = Math.min(state.end, baseOffset + (ctx.currentTime - startedAt));
+    updatePlayhead(state.playbackOffset, true);
+    state.playheadRaf = requestAnimationFrame(tick);
+  };
+  tick();
+}
+
+async function getProcessedPreviewBuffer() {
+  const signature = processingSignature();
+  if (state.previewBuffer && state.previewSignature === signature) return state.previewBuffer;
+  if (state.previewPromise && state.previewBuildSignature === signature) return state.previewPromise;
+
+  const token = ++state.previewBuildToken;
+  state.previewBuilding = true;
+  state.previewBuildSignature = signature;
+  const promise = (async () => {
+    const rendered = await renderProcessedBuffer();
+    if (token !== state.previewBuildToken || signature !== processingSignature()) return null;
+    state.previewBuffer = rendered;
+    state.previewSignature = signature;
+    return rendered;
+  })();
+  state.previewPromise = promise;
+
+  try {
+    return await promise;
+  } finally {
+    if (state.previewPromise === promise) {
+      state.previewPromise = null;
+      state.previewBuildSignature = '';
+      state.previewBuilding = false;
+    }
+  }
 }
 
 async function playSelection() {
   if (!state.buffer) return;
   if (state.source) { stopPlayback(); return; }
   const ctx = await ensureAudioContext();
-  const offset = Math.max(state.start, Math.min(state.playbackOffset || state.start, Math.max(state.start, state.end - .02)));
-  const duration = Math.max(.01, state.end - offset);
-  const source = ctx.createBufferSource();
-  source.buffer = state.buffer;
-  source.connect(ctx.destination);
-  state.source = source;
-  const startedAt = ctx.currentTime;
-  const baseOffset = offset;
-  source.start(0, offset, duration);
+  const absoluteOffset = Math.max(state.start, Math.min(state.playbackOffset || state.start, Math.max(state.start, state.end - .02)));
+  const signatureBefore = processingSignature();
+  els.playButton.disabled = true;
+  els.playButton.querySelector('span[aria-hidden]').textContent = '…';
+  els.playButton.querySelector('span:last-child').textContent = 'Procesando preview…';
 
-  els.playButton.querySelector('span[aria-hidden]').textContent = 'Ⅱ';
-  els.playButton.querySelector('span:last-child').textContent = 'Detener';
+  try {
+    const processed = await getProcessedPreviewBuffer();
+    if (!processed || signatureBefore !== processingSignature()) return stopPlayback(false);
+    const relativeOffset = Math.max(0, Math.min(absoluteOffset - state.start, Math.max(0, processed.duration - .02)));
+    const duration = Math.max(.01, processed.duration - relativeOffset);
+    const source = ctx.createBufferSource();
+    source.buffer = processed;
+    source.connect(ctx.destination);
+    state.source = source;
+    const startedAt = ctx.currentTime;
+    const baseAbsoluteOffset = state.start + relativeOffset;
+    source.start(0, relativeOffset, duration);
 
-  source.onended = () => {
-    if (state.source !== source) return;
-    state.source = null;
-    state.playbackOffset = state.start;
-    clearInterval(state.stopTimer);
-    state.stopTimer = null;
-    els.playButton.querySelector('span[aria-hidden]').textContent = '▶';
-    els.playButton.querySelector('span:last-child').textContent = 'Escuchar selección';
-    if (els.loopPreview.checked) playSelection();
-  };
-  state.stopTimer = setInterval(() => {
-    if (state.source === source) state.playbackOffset = Math.min(state.end, baseOffset + (ctx.currentTime - startedAt));
-  }, 100);
+    els.playButton.disabled = false;
+    els.playButton.querySelector('span[aria-hidden]').textContent = 'Ⅱ';
+    els.playButton.querySelector('span:last-child').textContent = 'Detener';
+    updatePlayhead(baseAbsoluteOffset, true);
+    startPlaybackTicker(ctx, startedAt, baseAbsoluteOffset);
+
+    source.onended = () => {
+      if (state.source !== source) return;
+      state.source = null;
+      state.playbackOffset = state.start;
+      if (state.playheadRaf) cancelAnimationFrame(state.playheadRaf);
+      state.playheadRaf = null;
+      updatePlayhead(state.start, false);
+      els.playButton.querySelector('span[aria-hidden]').textContent = '▶';
+      els.playButton.querySelector('span:last-child').textContent = 'Escuchar resultado';
+      if (els.loopPreview.checked) playSelection();
+    };
+  } catch (err) {
+    console.error(err);
+    stopPlayback(false);
+    toast('No se pudo preparar la previsualización procesada.', 3600);
+  }
 }
 
 async function smartCut() {
@@ -440,8 +555,15 @@ async function smartCut() {
 
 async function renderProcessedBuffer() {
   const src = state.buffer;
+  if (!src) throw new Error('No hay audio cargado');
+  const startTime = state.start;
+  const endTime = state.end;
+  const useNormalize = els.normalize.checked;
+  const useFadeIn = els.fadeIn.checked;
+  const useFadeOut = els.fadeOut.checked;
+  const manualGainDb = gainDbValue();
   const sampleRate = src.sampleRate;
-  const clipDuration = Math.max(0, state.end - state.start);
+  const clipDuration = Math.max(0, endTime - startTime);
   const length = Math.max(1, Math.floor(clipDuration * sampleRate));
   const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
   if (!OfflineCtx) throw new Error('OfflineAudioContext no está disponible');
@@ -452,33 +574,32 @@ async function renderProcessedBuffer() {
   source.connect(gain).connect(offline.destination);
 
   let peak = 0;
-  if (els.normalize.checked) {
-    const s0 = Math.floor(state.start * sampleRate);
-    const s1 = Math.min(src.length, s0 + length);
-    for (let ch = 0; ch < src.numberOfChannels; ch++) {
-      const data = src.getChannelData(ch);
-      for (let i = s0; i < s1; i++) peak = Math.max(peak, Math.abs(data[i]));
-    }
+  const s0 = Math.floor(startTime * sampleRate);
+  const s1 = Math.min(src.length, s0 + length);
+  for (let ch = 0; ch < src.numberOfChannels; ch++) {
+    const data = src.getChannelData(ch);
+    for (let i = s0; i < s1; i++) peak = Math.max(peak, Math.abs(data[i]));
   }
 
   const target = Math.pow(10, -1 / 20);
-  const baseGain = els.normalize.checked && peak > 0 ? Math.min(8, target / peak) : 1;
+  const normalizationGain = useNormalize && peak > 0 ? Math.min(8, target / peak) : 1;
+  const baseGain = normalizationGain * dbToGain(manualGainDb);
   const renderedDuration = length / sampleRate;
-  const fadeIn = Math.min(.8, renderedDuration / 3);
-  const fadeOut = Math.min(1.2, renderedDuration / 3);
+  const fadeInDuration = Math.min(.8, renderedDuration / 3);
+  const fadeOutDuration = Math.min(1.2, renderedDuration / 3);
 
   gain.gain.setValueAtTime(baseGain, 0);
-  if (els.fadeIn.checked && renderedDuration > .01) {
+  if (useFadeIn && renderedDuration > .01) {
     gain.gain.setValueAtTime(0, 0);
-    gain.gain.linearRampToValueAtTime(baseGain, fadeIn);
+    gain.gain.linearRampToValueAtTime(baseGain, fadeInDuration);
   }
-  if (els.fadeOut.checked && renderedDuration > .01) {
-    const fadeOutStart = Math.max(fadeIn, renderedDuration - fadeOut);
+  if (useFadeOut && renderedDuration > .01) {
+    const fadeOutStart = Math.max(fadeInDuration, renderedDuration - fadeOutDuration);
     gain.gain.setValueAtTime(baseGain, fadeOutStart);
     gain.gain.linearRampToValueAtTime(0, renderedDuration);
   }
 
-  source.start(0, state.start, renderedDuration);
+  source.start(0, startTime, renderedDuration);
   return offline.startRendering();
 }
 
@@ -523,20 +644,79 @@ async function audioBufferToMedia(buffer, mime) {
 
   return new Promise((resolve, reject) => {
     let settled = false;
-    const fail = err => { if (!settled) { settled = true; reject(err instanceof Error ? err : new Error('Error de codificación')); } };
+    let endDelay = null;
+    const timeout = setTimeout(() => fail(new Error('La codificación ha superado el tiempo máximo esperado')), Math.max(8000, (buffer.duration + 8) * 1000));
+    const cleanup = () => {
+      clearTimeout(timeout);
+      if (endDelay) clearTimeout(endDelay);
+      source.onended = null;
+      try { source.stop(); } catch {}
+      source.disconnect?.();
+      for (const track of dest.stream.getTracks()) track.stop();
+    };
+    const fail = err => {
+      if (settled) return;
+      settled = true;
+      try { if (recorder.state !== 'inactive') recorder.stop(); } catch {}
+      cleanup();
+      reject(err instanceof Error ? err : new Error('Error de codificación'));
+    };
     recorder.ondataavailable = event => { if (event.data?.size) chunks.push(event.data); };
     recorder.onerror = event => fail(event.error || new Error('Error MediaRecorder'));
     recorder.onstop = () => {
       if (settled) return;
       settled = true;
-      resolve(new Blob(chunks, {type: mime}));
+      const blob = new Blob(chunks, {type: mime});
+      cleanup();
+      resolve(blob);
     };
     try {
       recorder.start(250);
       source.start();
-      source.onended = () => setTimeout(() => { if (recorder.state !== 'inactive') recorder.stop(); }, 120);
+      source.onended = () => {
+        endDelay = setTimeout(() => {
+          try { if (recorder.state !== 'inactive') recorder.stop(); } catch (err) { fail(err); }
+        }, 120);
+      };
     } catch (err) { fail(err); }
   });
+}
+
+
+function validateWavHeader(arrayBuffer) {
+  if (arrayBuffer.byteLength < 44) throw new Error('WAV demasiado pequeño');
+  const bytes = new Uint8Array(arrayBuffer);
+  const text = (from, len) => String.fromCharCode(...bytes.slice(from, from + len));
+  if (text(0, 4) !== 'RIFF' || text(8, 4) !== 'WAVE') throw new Error('Cabecera WAV inválida');
+  if (text(12, 4) !== 'fmt ') throw new Error('Chunk fmt WAV ausente');
+  const dataPos = (() => {
+    for (let i = 12; i <= bytes.length - 8; ) {
+      const id = text(i, 4);
+      const size = new DataView(arrayBuffer).getUint32(i + 4, true);
+      if (id === 'data') return i;
+      i += 8 + size + (size % 2);
+    }
+    return -1;
+  })();
+  if (dataPos < 0) throw new Error('Chunk data WAV ausente');
+}
+
+async function validateGeneratedAudioBlob(blob, fmt) {
+  if (!blob || blob.size < 128) throw new Error('El codificador no devolvió un archivo válido');
+  const bytes = await blob.arrayBuffer();
+  if (fmt === 'wav') validateWavHeader(bytes);
+  const ctx = await ensureAudioContext();
+  let decoded;
+  try {
+    decoded = await ctx.decodeAudioData(bytes.slice(0));
+  } catch (err) {
+    throw new Error(`El archivo ${fmt.toUpperCase()} generado no pudo volver a decodificarse`);
+  }
+  if (!decoded || !Number.isFinite(decoded.duration) || decoded.duration <= 0 || decoded.duration > MAX_CLIP_SECONDS + 2) {
+    throw new Error(`Duración inválida en el ${fmt.toUpperCase()} generado`);
+  }
+  if (decoded.numberOfChannels < 1 || decoded.sampleRate < 8000) throw new Error('Metadatos de audio generados no válidos');
+  return {duration: decoded.duration, channels: decoded.numberOfChannels, sampleRate: decoded.sampleRate};
 }
 
 async function exportRingtone() {
@@ -544,45 +724,48 @@ async function exportRingtone() {
   clearDownload();
   els.exportButton.disabled = true;
   const fmt = els.formatSelect.value;
-  let progressTimer;
+  let elapsedTimer;
 
   try {
-    setProgress(8, 'Renderizando el fragmento…');
-    const processed = await renderProcessedBuffer();
-    setProgress(35, 'Audio procesado. Preparando archivo…');
+    setProgress(8, 'Renderizando exactamente lo que has previsualizado…');
+    const processed = await getProcessedPreviewBuffer() || await renderProcessedBuffer();
+    setProgress(36, 'Audio procesado. Preparando archivo…');
     let blob;
-    let extension = fmt;
+    const extension = fmt;
 
     if (fmt === 'wav') {
       blob = audioBufferToWav(processed);
-      setProgress(100, 'WAV creado correctamente.');
+      setProgress(88, 'WAV creado. Validando estructura y audio…');
     } else {
       const mime = bestMime(fmt);
       if (!mime) throw new Error(`Formato ${fmt.toUpperCase()} no soportado por este navegador`);
-      let p = 38;
-      progressTimer = setInterval(() => {
-        p = Math.min(92, p + 2);
-        setProgress(p, `Codificando ${fmt.toUpperCase()} localmente…`);
-      }, 700);
+      const started = performance.now();
+      setProgress(42, `Codificando ${fmt.toUpperCase()} localmente · fragmento ${processed.duration.toFixed(1)} s…`);
+      elapsedTimer = setInterval(() => {
+        const elapsed = Math.max(0, (performance.now() - started) / 1000);
+        setProgress(42, `Codificando ${fmt.toUpperCase()} localmente · ${elapsed.toFixed(0)} s transcurridos · fragmento ${processed.duration.toFixed(1)} s`);
+      }, 500);
       blob = await audioBufferToMedia(processed, mime);
-      clearInterval(progressTimer);
-      setProgress(100, `${fmt.toUpperCase()} creado correctamente.`);
+      clearInterval(elapsedTimer);
+      elapsedTimer = null;
+      setProgress(88, `${fmt.toUpperCase()} creado. Validando el archivo generado…`);
     }
 
-    if (!blob || blob.size < 128) throw new Error('El codificador no devolvió un archivo válido');
+    const validation = await validateGeneratedAudioBlob(blob, fmt);
+    setProgress(100, `${fmt.toUpperCase()} validado · ${validation.duration.toFixed(1)} s · listo para descargar.`);
     const name = `${sanitizeName(els.outputName.value)}.${extension}`;
     state.objectUrl = URL.createObjectURL(blob);
     els.downloadLink.href = state.objectUrl;
     els.downloadLink.download = name;
     els.downloadLink.textContent = `Descargar ${name} · ${(blob.size / 1024).toFixed(0)} KB`;
     els.downloadLink.hidden = false;
-    toast('Ringtone preparado para descargar.');
+    toast('Ringtone generado y validado correctamente.');
   } catch (err) {
     console.error(err);
     setProgress(0, err.message || 'No se pudo exportar.');
-    toast('No se pudo exportar con este formato.', 3600);
+    toast(err.message || 'No se pudo exportar con este formato.', 4200);
   } finally {
-    clearInterval(progressTimer);
+    if (elapsedTimer) clearInterval(elapsedTimer);
     updateFormatNote();
   }
 }
@@ -654,7 +837,8 @@ els.forwardButton.addEventListener('click', () => {
 });
 
 els.formatSelect.addEventListener('change', () => { clearDownload(); saveSettings(); updateFormatNote(); });
-[els.fadeIn, els.fadeOut, els.normalize].forEach(el => el.addEventListener('change', () => { clearDownload(); saveSettings(); }));
+[els.fadeIn, els.fadeOut, els.normalize].forEach(el => el.addEventListener('change', () => { invalidateProcessedPreview(); clearDownload(); updateGainUI(); saveSettings(); }));
+els.gainDb.addEventListener('input', () => { invalidateProcessedPreview(); clearDownload(); updateGainUI(); saveSettings(); });
 els.exportButton.addEventListener('click', exportRingtone);
 window.addEventListener('resize', () => { clearTimeout(drawWaveform.timer); drawWaveform.timer = setTimeout(drawWaveform, 100); });
 window.addEventListener('keydown', event => {
@@ -680,6 +864,7 @@ els.installButton.addEventListener('click', async () => {
 window.addEventListener('appinstalled', () => { state.deferredInstallPrompt = null; els.installButton.hidden = true; toast('Ringtone Forge 404 instalada.'); });
 
 restoreSettings();
+updateGainUI();
 updateCapabilities();
 
 if ('serviceWorker' in navigator) {

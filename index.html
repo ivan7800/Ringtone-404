@@ -35,7 +35,7 @@
     <section class="hero">
       <p class="eyebrow">RINGTONE TOOLKIT · UNIVERSO 404</p>
       <h1>Convierte tu audio en un ringtone de <span>hasta 30 segundos.</span></h1>
-      <p class="lede">Carga un archivo, elige el tramo exacto, escucha el resultado, aplica fundidos y normalización y expórtalo. Sin cuentas, sin telemetría y sin subir el audio.</p>
+      <p class="lede">Carga un archivo, elige el tramo exacto, escucha el resultado, aplica fundidos, normalización y ganancia y expórtalo. Sin cuentas, sin telemetría y sin subir el audio.</p>
       <div class="hero-badges" aria-label="Características principales">
         <span>OFFLINE</span><span>PRIVADO</span><span>30 S MÁX.</span><span>SIN BACKEND</span>
       </div>
@@ -75,6 +75,7 @@
             <div id="selectionOverlay" class="selection-overlay" aria-hidden="true">
               <div class="handle left"></div><div class="handle right"></div>
             </div>
+            <div id="playhead" class="playhead" hidden aria-hidden="true"></div>
           </div>
           <div class="timeline"><span>0:00</span><span id="midTime">0:00</span><span id="endTime">0:00</span></div>
           <p id="waveHelp" class="micro-help">Arrastra cerca del borde izquierdo o derecho de la selección para ajustar el corte.</p>
@@ -112,15 +113,21 @@
             <label class="toggle"><input id="fadeIn" type="checkbox" checked /><span></span><div><strong>Fade in</strong><small>Entrada suave de 0,8 s</small></div></label>
             <label class="toggle"><input id="fadeOut" type="checkbox" checked /><span></span><div><strong>Fade out</strong><small>Salida suave de 1,2 s</small></div></label>
             <label class="toggle"><input id="normalize" type="checkbox" checked /><span></span><div><strong>Normalizar</strong><small>Ajusta el pico a −1 dBFS</small></div></label>
+            <div class="gain-control">
+              <div class="gain-head"><label for="gainDb">Ganancia manual</label><output id="gainValue" for="gainDb">0.0 dB</output></div>
+              <input id="gainDb" type="range" min="-12" max="6" step="0.5" value="0" aria-describedby="gainWarning" />
+              <small id="gainWarning">Se aplica después de la normalización y forma parte tanto del preview como de la exportación.</small>
+            </div>
           </section>
         </div>
 
         <div class="transport" role="group" aria-label="Controles de reproducción">
           <button class="transport-btn" id="rewindButton" type="button" title="Retroceder 1 segundo">−1</button>
-          <button class="play" id="playButton" type="button"><span aria-hidden="true">▶</span><span>Escuchar selección</span></button>
+          <button class="play" id="playButton" type="button"><span aria-hidden="true">▶</span><span>Escuchar resultado</span></button>
           <button class="transport-btn" id="stopButton" type="button" title="Detener">■</button>
           <button class="transport-btn" id="forwardButton" type="button" title="Avanzar 1 segundo">+1</button>
           <label class="loop"><input id="loopPreview" type="checkbox" /> Repetir</label>
+          <span class="preview-note">Mismo procesado final</span>
         </div>
 
         <section class="export-card">
@@ -162,7 +169,7 @@
     </section>
   </main>
 
-  <footer><span>Ringtone Forge 404 · v1.2.0</span><span>Sin cuentas · Sin telemetría · Sin recursos remotos</span></footer>
+  <footer><span>Ringtone Forge 404 · v1.3.0</span><span>Sin cuentas · Sin telemetría · Sin recursos remotos</span></footer>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <noscript><p class="noscript">Ringtone Forge 404 necesita JavaScript para procesar audio localmente.</p></noscript>
   <script src="./app.js" defer></script>

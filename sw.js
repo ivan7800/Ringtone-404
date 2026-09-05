@@ -1,5 +1,5 @@
 'use strict';
-const CACHE = 'ringtone-forge-404-v1.2.0';
+const CACHE = 'ringtone-forge-404-v1.3.0';
 const CORE = ['./','./index.html','./styles.css','./app.js','./manifest.webmanifest','./assets/icon-192.png','./assets/icon-512.png','./assets/icon-maskable-192.png','./assets/icon-maskable-512.png'];
 
 self.addEventListener('install', event => {

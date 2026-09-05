@@ -2,14 +2,14 @@
 
 ## Modelo de seguridad
 
-Ringtone Forge 404 v1.2.0 es una PWA estática y local-first. No contiene backend, autenticación, telemetría, analytics ni subida de archivos.
+Ringtone Forge 404 v1.3.0 es una PWA estática y local-first. No contiene backend, autenticación, telemetría, analytics ni subida de archivos.
 
 ## Datos
 
 - El archivo seleccionado se lee mediante APIs del navegador y se decodifica en memoria.
 - No se envía a ningún servidor.
 - No se guarda el audio en `localStorage` ni IndexedDB.
-- `localStorage` se usa únicamente para preferencias del editor: fade, normalización y formato elegido.
+- `localStorage` se usa únicamente para preferencias del editor: fade, normalización, ganancia manual y formato elegido.
 - Las descargas se generan mediante URLs `blob:` locales y se revocan al sustituirse o cerrar la página.
 
 ## Red
